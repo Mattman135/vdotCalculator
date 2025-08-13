@@ -1,9 +1,8 @@
 import axios from "axios"
 
-// Create an instance of axios with the base URL
-const api = axios.create({
-  baseURL: "http://localhost:8000",
-})
+// Prefer Vite env var if provided, otherwise default to local backend
+const baseURL = import.meta.env?.VITE_API_URL || "http://localhost:8000"
 
-// Export the Axios instance
+const api = axios.create({ baseURL })
+
 export default api

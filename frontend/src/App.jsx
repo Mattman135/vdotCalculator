@@ -9,10 +9,12 @@ function App() {
   return (
     <div
       style={{
-        width: "500px",
+        maxWidth: 720,
+        width: "100%",
+        margin: "0 auto",
         display: "flex",
         flexDirection: "column",
-        justifyContent: "flex-start",
+        gap: 16,
         padding: 16,
       }}
     >
@@ -20,7 +22,6 @@ function App() {
         style={{
           display: "flex",
           gap: 8,
-          marginBottom: 16,
           justifyContent: "center",
         }}
       >
@@ -29,7 +30,7 @@ function App() {
         </button>
         <button onClick={() => setActive("lthr")}>LTHR Calculator</button>
       </div>
-      <div>
+      <div style={{ width: "100%" }}>
         {active === "hm" && <HMCalculator />}
         {active === "lthr" && <LthrZones />}
       </div>

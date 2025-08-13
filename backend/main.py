@@ -2,11 +2,20 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import sqlite3
 import os
 from typing import Optional, Dict, Any, List, Tuple, Union
+from supabase import create_client, Client
+from dotenv import load_dotenv
+from pathlib import Path
 
 app = FastAPI(debug=True)
+
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # keep private
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Allow requests from Vite dev server and common local ports
 origins = [
@@ -24,22 +33,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "vdot_data.db")
+# --- Supabase setup ---
+# Load .env from the backend directory explicitly so it works regardless of cwd
+_dotenv_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=_dotenv_path)
+# Read from env var key SUPABASE_URL, but default to your project URL as a fallback
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uyowiwivczuuajwxrhme.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY") or ""
+SUPABASE_TABLE_NAME = os.environ.get("SUPABASE_TABLE_NAME", "vdot_data")
+
+supabase_client: Optional[Client] = None
+
+def get_supabase() -> Optional[Client]:
+    global supabase_client
+    if supabase_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            print("Supabase not configured: missing SUPABASE_URL or API key", flush=True)
+            return None
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return supabase_client
+
+
+# Print a small sample of Supabase data on startup
+@app.on_event("startup")
+def print_supabase_sample_on_startup() -> None:
+    client = get_supabase()
+    if client is None:
+        print("Supabase not configured; skipping sample fetch.", flush=True)
+        return
+    try:
+        response = client.table(SUPABASE_TABLE_NAME).select("*").limit(5).execute()
+        rows: List[Dict[str, Any]] = getattr(response, "data", []) or []
+        print(f"Fetched {len(rows)} sample row(s) from '{SUPABASE_TABLE_NAME}':", flush=True)
+        for idx, row in enumerate(rows, start=1):
+            print(f"[{idx}] {row}", flush=True)
+    except Exception as e:
+        print(f"Supabase startup sample fetch failed: {e}", flush=True)
 
 class SubmitPayload(BaseModel):
     value: str
-
-
-def find_table_with_column(conn: sqlite3.Connection, column_name: str, preferred_table: str = "vdot_data") -> Optional[str]:
-    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-    preferred = [t for t in tables if t.lower() == preferred_table.lower()]
-    candidates = preferred + [t for t in tables if t not in preferred]
-    for table in candidates:
-        cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
-        col_names = {c[1].lower() for c in cols}
-        if column_name.lower() in col_names:
-            return table
-    return None
 
 
 # --- Time parsing helpers ---
@@ -94,77 +126,41 @@ def try_parse_db_time_to_seconds(raw: Union[str, int, float]) -> Optional[float]
     return number * 60
 
 
-def detect_db_time_unit_seconds(conn: sqlite3.Connection, table: str, column: str) -> str:
-    # Returns "seconds", "minutes", or "string" indicating storage style
-    sample_rows = conn.execute(
-        f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL LIMIT 20"
-    ).fetchall()
-    if not sample_rows:
-        return "unknown"
-    raw_values = [row[0] for row in sample_rows]
-    if any(isinstance(v, str) and ":" in v for v in raw_values):
-        return "string"  # time-like strings
-    # If numeric (or numeric strings), look at median magnitude
-    numeric_vals: List[float] = []
-    for v in raw_values:
-        try:
-            numeric_vals.append(float(v))
-        except Exception:
-            continue
-    if not numeric_vals:
-        return "unknown"
-    numeric_vals.sort()
-    median = numeric_vals[len(numeric_vals)//2]
-    return "seconds" if median >= 100 else "minutes"
-
-
 def query_row_closest_by_race_5km(value: str) -> Optional[Dict[str, Any]]:
-    if not os.path.exists(DB_PATH):
-        return None
-
+    # Convert the input to seconds
     target_seconds = parse_time_to_seconds(value)
     if target_seconds is None:
         return None
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        table = find_table_with_column(conn, column_name="race_5km", preferred_table="vdot_data")
-        if not table:
-            return None
-
-        storage_style = detect_db_time_unit_seconds(conn, table, "race_5km")
-
-        rows = conn.execute(f"SELECT * FROM {table} WHERE race_5km IS NOT NULL").fetchall()
-        best: Tuple[float, Optional[sqlite3.Row]] = (float("inf"), None)
-        for row in rows:
-            raw = row["race_5km"]
-            if storage_style == "string":
-                seconds = try_parse_db_time_to_seconds(raw)
-            elif storage_style == "minutes":
-                try:
-                    seconds = float(raw) * 60
-                except Exception:
-                    seconds = None
-            elif storage_style == "seconds":
-                try:
-                    seconds = float(raw)
-                except Exception:
-                    seconds = None
-            else:
-                seconds = try_parse_db_time_to_seconds(raw)
-
-            if seconds is None:
-                continue
-            dist = abs(seconds - target_seconds)
-            if dist < best[0]:
-                best = (dist, row)
-
-        if best[1] is not None:
-            return dict(best[1])
+    client = get_supabase()
+    if client is None:
+        # Supabase environment is not configured
         return None
-    finally:
-        conn.close()
+
+    # Fetch rows where race_5km is not null. Depending on your data size,
+    # you may want to further restrict or paginate the query.
+    try:
+        # Fetch rows; we'll filter out null race_5km values in Python for simplicity
+        response = client.table(SUPABASE_TABLE_NAME).select("*").limit(1000).execute()
+    except Exception as e:
+        print(f"Supabase query failed: {e}", flush=True)
+        return None
+
+    rows: List[Dict[str, Any]] = getattr(response, "data", []) or []
+    if not rows:
+        return None
+
+    best: Tuple[float, Optional[Dict[str, Any]]] = (float("inf"), None)
+    for row in rows:
+        raw = row.get("race_5km")
+        seconds = try_parse_db_time_to_seconds(raw)
+        if seconds is None:
+            continue
+        dist = abs(seconds - target_seconds)
+        if dist < best[0]:
+            best = (dist, row)
+
+    return best[1] if best[1] is not None else None
 
 
 @app.post("/submit")
